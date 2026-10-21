@@ -1,10 +1,20 @@
+import sys
+import base64
 from io import BytesIO
+from types import ModuleType
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
+import app.services.inference_service as inference_service
 from app.main import create_app
-from app.services.inference_service import Prediction
+from app.services.inference_service import (
+    DEFAULT_SKIN_CLASSES,
+    Prediction,
+    _load_one,
+    _normalize_class_scores,
+)
 
 
 class FakePredictor:
@@ -32,7 +42,7 @@ def test_health_and_models_report_loaded_predictor() -> None:
         models = client.get("/models")
 
     assert health.status_code == 200
-    assert health.json() == {"status": "ok", "models": {"skin": True, "cancer": False}}
+    assert health.json() == {"status": "degraded", "models": {"skin": True, "cancer": False}}
     assert models.json()["skin"] == {
         "ready": True,
         "classes": ["class-a", "class-b"],
@@ -112,3 +122,73 @@ def test_rejects_upload_larger_than_ten_megabytes() -> None:
         )
 
     assert response.status_code == 413
+
+
+def test_normalizes_single_output_binary_model_probabilities() -> None:
+    probabilities = _normalize_class_scores([0.8], ["benign", "malignant"])
+
+    assert probabilities.tolist() == [pytest.approx(0.2), pytest.approx(0.8)]
+
+
+def test_skin_artifact_runs_gradcam_inference_when_tensorflow_is_available() -> None:
+    pytest.importorskip("tensorflow")
+    predictor, detail = _load_one("skin")
+
+    assert detail is None
+    assert predictor is not None
+    result = predictor.predict(Image.new("RGB", (224, 224), color=(120, 80, 60)))
+
+    assert result.predicted_class in DEFAULT_SKIN_CLASSES
+    assert sum(result.probabilities.values()) == pytest.approx(1.0)
+    assert result.gradcam is not None
+    assert base64.b64decode(result.gradcam).startswith(b"\xff\xd8")
+
+
+def test_loads_extracted_keras_model_with_skin_defaults(tmp_path, monkeypatch) -> None:
+    model_path = tmp_path / "skin.keras"
+    model_path.mkdir()
+    (model_path / "config.json").write_text("{}", encoding="utf-8")
+    (model_path / "model.weights.h5").touch()
+
+    class FakeModel:
+        input_shape = (None, 224, 224, 3)
+        output_shape = (None, 7)
+
+        def load_weights(self, path) -> None:
+            assert path == model_path / "model.weights.h5"
+
+    class LoadedPredictor:
+        def __init__(self, classes: list[str], preprocessing: str) -> None:
+            self.classes = classes
+            self.preprocessing = preprocessing
+
+    fake_model = FakeModel()
+    models_module = ModuleType("tensorflow.keras.models")
+    models_module.model_from_json = lambda config: fake_model
+    models_module.load_model = lambda path: None
+    keras_module = ModuleType("tensorflow.keras")
+    keras_module.models = models_module
+    tensorflow_module = ModuleType("tensorflow")
+    tensorflow_module.keras = keras_module
+
+    monkeypatch.setitem(sys.modules, "tensorflow", tensorflow_module)
+    monkeypatch.setitem(sys.modules, "tensorflow.keras", keras_module)
+    monkeypatch.setitem(sys.modules, "tensorflow.keras.models", models_module)
+    monkeypatch.setenv("MEDSCAN_SKIN_MODEL_PATH", str(model_path))
+    monkeypatch.delenv("MEDSCAN_SKIN_CLASSES", raising=False)
+    monkeypatch.delenv("MEDSCAN_SKIN_PREPROCESSING", raising=False)
+    monkeypatch.setattr(
+        inference_service,
+        "KerasPredictor",
+        lambda model, classes, preprocessing, input_size, gradcam_layer=None: LoadedPredictor(
+            classes,
+            preprocessing,
+        ),
+    )
+
+    predictor, detail = _load_one("skin")
+
+    assert detail is None
+    assert predictor is not None
+    assert predictor.classes == DEFAULT_SKIN_CLASSES
+    assert predictor.preprocessing == "minus_one_one"

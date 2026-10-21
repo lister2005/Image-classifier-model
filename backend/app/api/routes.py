@@ -14,7 +14,7 @@ router = APIRouter()
 @router.get("/health")
 def health(request: Request) -> dict[str, object]:
     models = request.app.state.model_status
-    ready = any(model.ready for model in models.values())
+    ready = all(model.ready for model in models.values())
     return {
         "status": "ok" if ready else "degraded",
         "models": {name: model.ready for name, model in models.items()},
